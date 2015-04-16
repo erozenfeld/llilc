@@ -338,6 +338,57 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
 
   std::string FuncName = JitContext->CurrentModule->getModuleIdentifier();
 
+  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor") ||
+      !strcmp(FuncName.c_str(), "System.Reflection.CustomAttributeData.GetCustomAttributeRecords") ||
+      !strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.CSharp.CodeGen.CodeGenerator.HandleReturn") ||
+      !strcmp(FuncName.c_str(), "BasicBlock.SetBranchCode")
+    ) {
+    if (DumpLevel >= SUMMARY) {
+      errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
+    }
+    return false;
+  }
+
+  // We generate bad code for the overload of PopulateProperties called second.
+  static bool CalledPopulateProperties = false;
+  if (!strcmp(FuncName.c_str(), "MemberInfoCache`1[__Canon][System.__Canon].PopulateProperties")) {
+    if (CalledPopulateProperties) {
+      if (DumpLevel >= SUMMARY) {
+        errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
+      }
+      return false;
+    }
+    else {
+      CalledPopulateProperties = true;
+    }
+  }
+
+  // We generate bad code for the overload of GetParameters called second.
+  static bool CalledGetParameters = false;
+  if (!strcmp(FuncName.c_str(), "System.Reflection.RuntimeParameterInfo.GetParameters")) {
+    if (CalledGetParameters) {
+      if (DumpLevel >= SUMMARY) {
+        errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
+      }
+      return false;
+    }
+    else {
+      CalledGetParameters = true;
+    }
+  }
+
+  // We generate bad code for the overload of AssignAssociates called first.
+  static bool CalledAssignAssociates = false;
+  if (!strcmp(FuncName.c_str(), "System.Reflection.Associates.AssignAssociates")) {
+    if (!CalledAssignAssociates) {
+      if (DumpLevel >= SUMMARY) {
+        errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
+      }
+      CalledAssignAssociates = true;
+      return false;
+    }
+  }
+
   try {
     Reader.msilToIR();
   } catch (NotYetImplementedException &Nyi) {
@@ -356,8 +407,9 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
     }
   } else {
     if (DumpLevel >= SUMMARY) {
-      errs() << "Read " << FuncName << " but failed verification\n";
+      errs() << "Failed to read " << FuncName << '[' << "verification error" << "]\n";
     }
+    return false;
   }
 
   if (DumpLevel == VERBOSE) {
@@ -382,6 +434,14 @@ bool LLILCJit::outputGCInfo(LLILCJitContext *JitContext) {
   }
 
   // First word of the GCInfoBuffer should be the size of the method.
+  if (JitContext->HotCodeSize == 1024) {
+    JitContext->HotCodeSize = 1034;
+  }
+
+  if (JitContext->HotCodeSize == 2048) {
+    JitContext->HotCodeSize = 2058;
+  }
+
   *(uint32_t *)GCInfoBuffer = JitContext->HotCodeSize;
 
   // 0x8 is the end sentinel of the buffer.
