@@ -1,13 +1,15 @@
 Welcome to LLILC
 ================
 
+[![Join the chat at https://gitter.im/dotnet/llilc](https://badges.gitter.im/Join%20Chat.svg)](https://gitter.im/dotnet/llilc?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
+
 Build Status
 ------------
 
 |           |    Windows    |    Linux    |
 |-----------|---------------|-------------|
-| **Debug** |[![Build status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_windows_debug_win64/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_windows_debug_win64/)|[![Build Status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_debug/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_debug/)|
-|**Release**|[![Build status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_windows_release_win64/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_windows_release_win64/)|[![Build Status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_release/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_release/)|
+| **Debug** |[![Build status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_debug_win64/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_debug_win64/)|[![Build Status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_debug/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_debug/)|
+|**Release**|[![Build status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_release_win64/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_release_win64/)|[![Build Status](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_release/badge/icon)](http://dotnet-ci.cloudapp.net/job/dotnet_llilc_linux_release/)|
 
 
 Introduction

@@ -1,8 +1,6 @@
-Exception Handling in the LLILC JIT
-========================================
+# Exception Handling in the LLILC JIT
 
-Introduction
-------------
+## Introduction
 
 This document provides a high-level overview of the LLILC jit's processing
 of exception handling constructs in the code it compiles.  It is not a fully
@@ -25,8 +23,7 @@ This document pertains specifically to just-in-time compilation.  Details
 for ahead-of-time compilation would possibly differ.
 
 
-EH Constructs in MSIL
----------------------
+## EH Constructs in MSIL
 
 MSIL exception handling constructs are defined in [ECMA-335 Partitions I, II, and
 III](http://www.ecma-international.org/publications/standards/Ecma-335.htm).
@@ -67,8 +64,7 @@ handlers associated with protected regions being exited before transferring
 control to the `leave` target.
 
 
-Contract with CLR Execution Engine
-----------------------------------
+## Contract with CLR Execution Engine
 
 This section describes the constraints that the Execution Engine imposes on
 the jit (and its codegen) to support exception processing.
@@ -161,8 +157,7 @@ this section may differ for other architectures (particularly x86), where
 unwinding may proceed differently.
 
 
-LLVM IR Model for Exception/Cleanup Flow
-----------------------------------------
+## LLVM IR Model for Exception/Cleanup Flow
 
 Exception handling in LLVM is [documented at llvm.org](http://llvm.org/docs/ExceptionHandling.html).
 Briefly, exceptions may only be raised at [`invoke`
@@ -197,8 +192,7 @@ codegen) to collapse the explicit dispatch and to separate non-filter
 funclets by outlining handlers.
 
 
-Potential Sticking Points
--------------------------
+## Potential Sticking Points
 
 There are a number of design points where the .Net Jit/EE have taken a
 different approach than most of the targets that LLVM supports.  The
@@ -355,13 +349,12 @@ caller.  The SEH support currently being added to LLVM expects filters to be
 outlined by the front-end (and support for this outlining has been [added to
 clang](http://reviews.llvm.org/rL226760)).  Similar outlining will need to
 be performed by LLILC.  With this approach, the invocation of the outlined
-filter can conceptually be modeled as part of the execution of the
-beginfinally/beginfault intrinsic that [LLILC will insert](#finally-handlers)
-at the start of each finally/fault handler.
+filter is modeled as an effect of the `invoke` target (the invoke target
+must call an external function to raise an exception, which therefore must
+be conservatively modeled as possibly calling the filter function).
 
 
-Translation from MSIL to LLVM IR in Reader
-------------------------------------------
+## Translation from MSIL to LLVM IR in Reader
 
 This section describes the processing of EH constructs in the MSIL Reader.
 The goal is to translate the MSIL constructs into IR constructs that match
@@ -411,12 +404,8 @@ write aliases (in particular, they need to interfere with `rethrow`).
 Any region protected by a finally handler will have an associated
 `landingpad` that is the target of exception edges.  The `landingpad` will
 have a `cleanup` clause.  The code of the finally handler will follow the
-`landingpad`, prefixed by a `beginfinally`.  The `beginfinally` intrinsic
-will model the effects of potentially calling outer filters before invoking
-the finally (Note: LLVM currently does not have a `beginfinally` intrinsic;
-it can be specific to LLILC initially but may be a good candidate to push up
-into llvm).  Control at the end of a finally handler may flow to a number of
-different places (an outer exception handler, or the target of any `leave`
+`landingpad`.  Control at the end of a finally handler may flow to a number
+of different places (an outer exception handler, or the target of any `leave`
 instruction that crosses the finally handler).  The code used for this
 sequence should match what the LLVM optimizer and funclet outliner
 expect to see; the outliner logic is [still being
@@ -435,8 +424,6 @@ One performance consideration of note for finally handlers is that jits
 often make a clone of the finally handler for the primary non-exceptional
 path, to allow better optimization (and avoid the overhead of a call at
 runtime) along that path.  This will be considered after initial bring-up.
-It would be legal to remove the `beginfinally` intrinsic call in the
-non-exceptional clone when this is done.
 
 ### Fault Handlers
 Fault handlers will essentially be treated like [finally handlers](#finally-handlers),
@@ -445,15 +432,13 @@ during the processing of `leave` instructions (and in general will never
 insert code to enter fault handlers except from landing pads), and therefore
 fault handlers don't need associated continuation selector variables (the end
 of a fault handler will branch unconditionally to the exception continuation).
-It may make sense to use a `beginfault` intrinsic rather than `beginfinally`
-for fault handlers.
 
 ### Filter Handlers
 Filters have a "filter part" and a "handler part".  The "filter part" will
 be outlined at the start of compilation, so that referenced locals can be
-moved to closures and the calls to filters implicit in beginfinally
-intrinsic invocations are a sound representation of the control flow into
-and out of filters.  The "handler part" will be treated similar to a [catch
+moved to closures and the calls to filters implicit in throwing `invoke`
+targets are a sound representation of the control flow into and out of
+filters.  The "handler part" will be treated similar to a [catch
 handler](#catch-handlers), with the difference that, following the LLVM
 convention for SEH, the address of the outlined filter function will appear
 in the landing pad where the type of caught exception appears for catch
@@ -478,8 +463,7 @@ then branch to the innermost finally handler whose protected region it
 exits.
 
 
-Translation from LLVM IR to EH Tables
--------------------------------------
+## Translation from LLVM IR to EH Tables
 
 The plan for LLILC is to use the LLVM code that is currently being developed
 to support native Windows EH in order to identify the structure of the
@@ -489,8 +473,7 @@ encoded in the two cases is essentially similar, so a mapping should be
 feasible.
 
 
-Staging Plan and Current Status
--------------------------------
+## Staging Plan and Current Status
 
 Full EH support will take a while to implement, and many jit tests don't
 throw exceptions at runtime and therefore don't require full EH support to
@@ -545,7 +528,6 @@ In summary, the plan/status is:
    - [ ] Support for `rethrow`
    - [ ] Finally handler support
      - [ ] In reader (includes `leave` processing, continuation selection)
-     - [ ] Beginfinally intrinsic handling
      - [ ] EH Clause generation
    - [ ] Filter handler support
      - [ ] In reader (includes early outlining)
@@ -562,8 +544,7 @@ In summary, the plan/status is:
 ahead-of-time is TBD, based on future priorities.)
 
 
-Open Questions
---------------
+## Open Questions
 
  1. Can filter outlining leverage some of the same outlining utilities used
     by the late outlining of handlers in LLVM, or is it best performed

@@ -24,6 +24,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/CallSite.h"
 #include "reader.h"
 #include "abi.h"
 #include "abisignature.h"
@@ -368,9 +369,7 @@ public:
                     ReaderAlignType Alignment, bool IsVolatile) override;
 
   IRNode *loadNull() override;
-  IRNode *localAlloc(IRNode *Arg, bool ZeroInit) override {
-    throw NotYetImplementedException("localAlloc");
-  };
+  IRNode *localAlloc(IRNode *Arg, bool ZeroInit) override;
   IRNode *loadFieldAddress(CORINFO_RESOLVED_TOKEN *ResolvedToken,
                            IRNode *Obj) override;
 
@@ -420,9 +419,8 @@ public:
 
   IRNode *loadNonPrimitiveObj(IRNode *Addr, CORINFO_CLASS_HANDLE ClassHandle,
                               ReaderAlignType Alignment, bool IsVolatile,
-                              bool AddressMayBeNull = true) override {
-    throw NotYetImplementedException("loadNonPrimitiveObj");
-  };
+                              bool AddressMayBeNull = true) override;
+
   IRNode *makeRefAny(CORINFO_RESOLVED_TOKEN *ResolvedToken,
                      IRNode *Object) override {
     throw NotYetImplementedException("makeRefAny");
@@ -436,7 +434,7 @@ public:
   };
 
   void rethrow() override { throw NotYetImplementedException("rethrow"); };
-  void returnOpcode(IRNode *Opr, bool SynchronousMethod) override;
+  void returnOpcode(IRNode *Opr, bool IsSynchronizedMethod) override;
   IRNode *shift(ReaderBaseNS::ShiftOpcode Opcode, IRNode *ShiftAmount,
                 IRNode *ShiftOperand) override;
   IRNode *sizeofOpcode(CORINFO_RESOLVED_TOKEN *ResolvedToken) override;
@@ -505,7 +503,7 @@ public:
   methodNeedsToKeepAliveGenericsContext(bool KeepGenericsCtxtAlive) override;
 
   // Called to instantiate an empty reader stack.
-  ReaderStack *createStack(uint32_t MaxStack, ReaderBase *Reader) override;
+  ReaderStack *createStack() override;
 
   // Called when reader begins processing method.
   void readerPrePass(uint8_t *Buf, uint32_t NumBytes) override;
@@ -721,13 +719,13 @@ public:
                               IRNode *ThisArg) override;
 
   // Helper callback used by rdrCall to emit call code.
-  IRNode *genCall(ReaderCallTargetData *CallTargetInfo,
+  IRNode *genCall(ReaderCallTargetData *CallTargetInfo, bool MayThrow,
                   std::vector<IRNode *> Args, IRNode **CallNode) override;
 
   bool canMakeDirectCall(ReaderCallTargetData *CallTargetData) override;
 
   // Generate call to helper
-  IRNode *callHelper(CorInfoHelpFunc HelperID, IRNode *Dst,
+  IRNode *callHelper(CorInfoHelpFunc HelperID, bool MayThrow, IRNode *Dst,
                      IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
                      IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
                      ReaderAlignType Alignment = Reader_AlignUnknown,
@@ -735,12 +733,13 @@ public:
                      bool CanMoveUp = false) override;
 
   // Generate call to helper
-  IRNode *callHelperImpl(CorInfoHelpFunc HelperID, llvm::Type *ReturnType,
-                         IRNode *Arg1 = nullptr, IRNode *Arg2 = nullptr,
-                         IRNode *Arg3 = nullptr, IRNode *Arg4 = nullptr,
-                         ReaderAlignType Alignment = Reader_AlignUnknown,
-                         bool IsVolatile = false, bool NoCtor = false,
-                         bool CanMoveUp = false);
+  llvm::CallSite callHelperImpl(CorInfoHelpFunc HelperID, bool MayThrow,
+                                llvm::Type *ReturnType, IRNode *Arg1 = nullptr,
+                                IRNode *Arg2 = nullptr, IRNode *Arg3 = nullptr,
+                                IRNode *Arg4 = nullptr,
+                                ReaderAlignType Alignment = Reader_AlignUnknown,
+                                bool IsVolatile = false, bool NoCtor = false,
+                                bool CanMoveUp = false);
 
   /// Generate special generics helper that might need to insert flow. The
   /// helper is called if NullCheckArg is null at compile-time or if it
@@ -754,6 +753,13 @@ public:
   /// PHI of NullCheckArg and the generated call instruction.
   IRNode *callRuntimeHandleHelper(CorInfoHelpFunc Helper, IRNode *Arg1,
                                   IRNode *Arg2, IRNode *NullCheckArg);
+
+  /// Generate a helper call to enter or exit a monitor used by synchronized
+  /// methods.
+  ///
+  /// \param IsEnter true if the monitor should be entered; false if the monitor
+  /// should be exited.
+  void callMonitorHelper(bool IsEnter);
 
   IRNode *convertToBoxHelperArgumentType(IRNode *Opr,
                                          CorInfoType CorType) override;
@@ -873,8 +879,19 @@ private:
                              CORINFO_RESOLVED_TOKEN *ResolvedToken,
                              CORINFO_FIELD_INFO *FieldInfo) override;
 
-  IRNode *getPrimitiveAddress(IRNode *Addr, CorInfoType CorInfoType,
-                              ReaderAlignType Alignment, uint32_t *Align);
+  /// Get a node with the same value as Addr but typed as a pointer to the type
+  /// corresponding to CorInfoType and ClassHandle.
+  ///
+  /// \param Addr Address to change the type on.
+  /// \param  CorInfoType Type that Addr should point to.
+  /// \param ClassHandle Class handle corresponding to CorInfoType.
+  /// \param ReaderAlignment Reader alignment of the Addr access.
+  /// \param Alignment [out] Converted alignment corresponding to
+  /// ReaderAlignment.
+  /// \returns Address pointing to a value of the specified type.
+  IRNode *getTypedAddress(IRNode *Addr, CorInfoType CorInfoType,
+                          CORINFO_CLASS_HANDLE ClassHandle,
+                          ReaderAlignType ReaderAlignment, uint32_t *Alignment);
   /// Generate instructions for loading value of the specified type at the
   /// specified address.
   ///
@@ -935,13 +952,30 @@ private:
   ///
   /// Use this method to create a block when expanding a single MSIL
   /// instruction into an instruction sequence with control flow. Give the
+  /// block the given MSIL offset at both begin and end since it represents
+  /// code at a single point in the IL stream. Mark the block as not
+  /// contributing an operand stack to any subsequent join.
+  ///
+  /// \param PointOffset       MSIL offset the block starts and ends at.
+  /// \param BlockName         Optional name for the new block.
+  /// \returns                 Newly allocated block.
+  llvm::BasicBlock *createPointBlock(uint32_t PointOffset,
+                                     const llvm::Twine &BlockName = "");
+
+  /// \brief Create a basic block for use when expanding a single MSIL
+  /// instruction.
+  ///
+  /// Use this method to create a block when expanding a single MSIL
+  /// instruction into an instruction sequence with control flow. Give the
   /// block the current MSIL offset at both begin and end since it represents
   /// code at a single point in the IL stream. Mark the block as not
   /// contributing an operand stack to any subsequent join.
   ///
   /// \param BlockName         Optional name for the new block.
   /// \returns                 Newly allocated block.
-  llvm::BasicBlock *createPointBlock(const llvm::Twine &BlockName = "");
+  llvm::BasicBlock *createPointBlock(const llvm::Twine &BlockName = "") {
+    return createPointBlock(CurrInstrOffset, BlockName);
+  }
 
   /// \brief Insert a conditional branch to a point block.
   ///
@@ -1009,17 +1043,19 @@ private:
   ///
   /// \param Condition Condition that will trigger the call.
   /// \param HelperId Id of the call helper.
+  /// \param MayThrow true if the helper call may raise an exception.
   /// \param ReturnType Return type of the call helper.
   /// \param Arg1 First helper argument.
   /// \param Arg2 Second helper argument.
   /// \param CallReturns true iff the helper call returns.
   /// \param CallBlockName Name of the basic block that will contain the call.
-  /// \returns Generated call instruction.
-  llvm::CallInst *genConditionalHelperCall(llvm::Value *Condition,
-                                           CorInfoHelpFunc HelperId,
-                                           llvm::Type *ReturnType, IRNode *Arg1,
-                                           IRNode *Arg2, bool CallReturns,
-                                           const llvm::Twine &CallBlockName);
+  /// \returns Generated call/invoke instruction.
+  llvm::CallSite genConditionalHelperCall(llvm::Value *Condition,
+                                          CorInfoHelpFunc HelperId,
+                                          bool MayThrow, llvm::Type *ReturnType,
+                                          IRNode *Arg1, IRNode *Arg2,
+                                          bool CallReturns,
+                                          const llvm::Twine &CallBlockName);
 
   /// Generate a call to the throw helper if the condition is met.
   ///
@@ -1121,6 +1157,17 @@ private:
   llvm::LoadInst *makeLoadNonNull(llvm::Value *Address, bool IsVolatile) {
     return makeLoad(Address, IsVolatile, false);
   }
+
+  /// \brief Create a call or invoke instruction
+  ///
+  /// The call is inserted at the LLVMBuilder's current insertion point.
+  ///
+  /// \param Callee    Target of the call
+  /// \param MayThrow  True if the callee may raise an exception
+  /// \param Args      Arguments to pass to the callee
+  /// \returns         A \p CallSite wrapping the CallInst or InvokeInst
+  llvm::CallSite makeCall(llvm::Value *Callee, bool MayThrow,
+                          llvm::ArrayRef<llvm::Value *> Args);
 
   /// Store a value to an argument passed indirectly.
   ///
@@ -1257,6 +1304,13 @@ private:
   bool NeedsSecurityObject;
   llvm::BasicBlock *EntryBlock;
   llvm::Instruction *TempInsertionPoint;
+  IRNode *MethodSyncHandle; ///< If the method is synchronized, this is
+                            ///< the handle used for entering and exiting
+                            ///< the monitor.
+  llvm::Value *SyncFlag;    ///< For synchronized methods this flag
+                            ///< indicates whether the monitor has been
+                            ///< entered. It is set and checked by monitor
+                            ///< helpers.
   uint32_t TargetPointerSizeInBits;
   const uint32_t UnmanagedAddressSpace = 0;
   const uint32_t ManagedAddressSpace = 1;

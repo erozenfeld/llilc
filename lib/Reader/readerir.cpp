@@ -80,10 +80,12 @@ ReaderStack *GenStack::copy() {
   return Copy;
 }
 
-ReaderStack *GenIR::createStack(uint32_t MaxStack, ReaderBase *Reader) {
-  void *Buffer = Reader->getTempMemory(sizeof(GenStack));
+ReaderStack *GenIR::createStack() {
+  uint32_t MaxStack =
+      std::min(MethodInfo->maxStack, std::min(100U, MethodInfo->ILCodeSize));
+  void *Buffer = getTempMemory(sizeof(GenStack));
   // extra 16 should reduce frequency of reallocation when inlining / jmp
-  return new (Buffer) GenStack(MaxStack + 16, Reader);
+  return new (Buffer) GenStack(MaxStack + 16, this);
 }
 
 #pragma endregion
@@ -277,7 +279,7 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
     ASSERTNR(UNREACHED);
   }
 
-  if (!LLILCJit::TheJit->ShouldUseConservativeGC) {
+  if (LLILCJit::TheJit->ShouldInsertStatepoints) {
     createSafepointPoll();
   }
 
@@ -301,9 +303,10 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
       ABIMethodSignature(MethodSignature, *this, *JitContext->TheABIInfo);
   Function = ABIMethodSig.createFunction(*this, *JitContext->CurrentModule);
 
-  EntryBlock = BasicBlock::Create(*JitContext->LLVMContext, "entry", Function);
+  llvm::LLVMContext &LLVMContext = *JitContext->LLVMContext;
+  EntryBlock = BasicBlock::Create(LLVMContext, "entry", Function);
 
-  LLVMBuilder = new IRBuilder<>(*this->JitContext->LLVMContext);
+  LLVMBuilder = new IRBuilder<>(LLVMContext);
   LLVMBuilder->SetInsertPoint(EntryBlock);
 
   // Note numArgs may exceed the IL argument count when there
@@ -365,9 +368,26 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
   // Check for special cases where the Jit needs to do extra work.
   const uint32_t MethodFlags = getCurrentMethodAttribs();
 
-  // TODO: support for synchronized methods
+  // Check for synchronized method. If a method is synchronized the JIT is
+  // required to insert a helper call to MONITOR_ENTER before we start the user
+  // code. A similar call to MONITOR_EXIT will be placed at the return site.
+  // TODO: when we start catching exceptions we should create a try/fault for
+  // the entire method so that we can exit the monitor on unhandled exceptions.
+  MethodSyncHandle = nullptr;
+  SyncFlag = nullptr;
   if (MethodFlags & CORINFO_FLG_SYNCH) {
-    throw NotYetImplementedException("synchronized method");
+    MethodSyncHandle = rdrGetCritSect();
+    Type *SyncFlagType = Type::getInt8Ty(LLVMContext);
+
+    // Create address taken local SyncFlag. This will be passed by address to
+    // MONITOR_ENTER and MONITOR_EXIT. MONITOR_ENTER will set SyncFlag once lock
+    // has been obtained, MONITOR_EXIT only releases lock if SyncFlag is set.
+    SyncFlag = createTemporary(SyncFlagType, "SyncFlag");
+    Constant *ZeroConst = Constant::getNullValue(SyncFlagType);
+    LLVMBuilder->CreateStore(ZeroConst, SyncFlag);
+
+    const bool IsEnter = true;
+    callMonitorHelper(IsEnter);
   }
 
   if ((JitFlags & CORJIT_FLG_DEBUG_CODE) && !(JitFlags & CORJIT_FLG_IL_STUB)) {
@@ -390,10 +410,11 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
       Value *Condition = LLVMBuilder->CreateIsNotNull(JustMyCodeFlag, "JMC");
       IRNode *Zero = loadConstantI4(0);
       Type *Void = Type::getVoidTy(*JitContext->LLVMContext);
+      const bool MayThrow = false;
       const bool CallReturns = true;
       genConditionalHelperCall(
-          Condition, CorInfoHelpFunc::CORINFO_HELP_DBG_IS_JUST_MY_CODE, Void,
-          JustMyCodeFlag, Zero, CallReturns, "JustMyCodeHook");
+          Condition, CorInfoHelpFunc::CORINFO_HELP_DBG_IS_JUST_MY_CODE,
+          MayThrow, Void, JustMyCodeFlag, Zero, CallReturns, "JustMyCodeHook");
     }
   }
 
@@ -429,7 +450,7 @@ void GenIR::readerPostPass(bool IsImportOnly) {
     insertIRForSecurityObject();
   }
 
-  if (!LLILCJit::TheJit->ShouldUseConservativeGC) {
+  if (LLILCJit::TheJit->ShouldInsertStatepoints) {
 
     // Precise GC using statepoints cannot handle aggregates that contain
     // managed pointers yet. So, check if this function deals with such values
@@ -490,7 +511,8 @@ void GenIR::insertIRToKeepGenericContextAlive() {
   Value *FrameEscape = Intrinsic::getDeclaration(JitContext->CurrentModule,
                                                  Intrinsic::frameescape);
   Value *Args[] = {ContextLocalAddress};
-  LLVMBuilder->CreateCall(FrameEscape, Args);
+  const bool MayThrow = false;
+  makeCall(FrameEscape, MayThrow, Args);
   // Don't move TempInsertionPoint up since what we added was not an alloca
   LLVMBuilder->restoreIP(SavedInsertPoint);
 
@@ -525,7 +547,8 @@ void GenIR::insertIRForSecurityObject() {
                                       IsIndirect, IsRelocatable, IsCallTarget);
   CorInfoHelpFunc SecurityHelper =
       JitContext->JitInfo->getSecurityPrologHelper(MethodHandle);
-  callHelper(SecurityHelper, nullptr, MethodNode,
+  const bool MayThrow = true;
+  callHelper(SecurityHelper, MayThrow, nullptr, MethodNode,
              (IRNode *)SecurityObjectAddress);
 
   LLVMBuilder->restoreIP(SavedInsertPoint);
@@ -535,6 +558,20 @@ void GenIR::insertIRForSecurityObject() {
 
   // TODO: we must convey the offset of the security object to the runtime
   // via the GC encoding.
+}
+
+void GenIR::callMonitorHelper(bool IsEnter) {
+  CorInfoHelpFunc HelperId;
+  const uint32_t MethodFlags = getCurrentMethodAttribs();
+  if (MethodFlags & CORINFO_FLG_STATIC) {
+    HelperId =
+        IsEnter ? CORINFO_HELP_MON_ENTER_STATIC : CORINFO_HELP_MON_EXIT_STATIC;
+  } else {
+    HelperId = IsEnter ? CORINFO_HELP_MON_ENTER : CORINFO_HELP_MON_EXIT;
+  }
+  const bool MayThrow = false;
+  callHelperImpl(HelperId, MayThrow, Type::getVoidTy(*JitContext->LLVMContext),
+                 MethodSyncHandle, (IRNode *)SyncFlag);
 }
 
 #pragma endregion
@@ -1893,6 +1930,7 @@ void GenIR::fgNodeSetEndMSILOffset(FlowGraphNode *Fg, uint32_t Offset) {
 FlowGraphNode *GenIR::fgSplitBlock(FlowGraphNode *Block, IRNode *Node) {
   Instruction *Inst = (Instruction *)Node;
   BasicBlock *TheBasicBlock = (BasicBlock *)Block;
+  bool PropagatesStack = fgNodePropagatesOperandStack(Block);
   BasicBlock *NewBlock;
   if (Inst == nullptr) {
     NewBlock = BasicBlock::Create(*JitContext->LLVMContext, "", Function,
@@ -1928,6 +1966,7 @@ FlowGraphNode *GenIR::fgSplitBlock(FlowGraphNode *Block, IRNode *Node) {
       BranchInst::Create(NewBlock, TheBasicBlock);
     }
   }
+  fgNodeSetPropagatesOperandStack((FlowGraphNode *)NewBlock, PropagatesStack);
   return (FlowGraphNode *)NewBlock;
 }
 
@@ -2466,13 +2505,17 @@ IRNode *GenIR::binaryOp(ReaderBaseNS::BinaryOpcode Opcode, IRNode *Arg1,
       llvm_unreachable("Bad floating point type!");
     }
 
-    Result = callHelperImpl(Helper, ResultType, Arg1, Arg2);
+    const bool MayThrow = false;
+    Result = (IRNode *)callHelperImpl(Helper, MayThrow, ResultType, Arg1, Arg2)
+                 .getInstruction();
   } else if (IsOverflow) {
     // Call the appropriate intrinsic.  Its result is a pair of the arithmetic
     // result and a bool indicating whether the operation overflows.
     Value *Intrinsic = Intrinsic::getDeclaration(
         JitContext->CurrentModule, Triple[Opcode].Op.Intrinsic, ResultType);
-    Value *Pair = LLVMBuilder->CreateCall2(Intrinsic, Arg1, Arg2);
+    Value *Args[] = {Arg1, Arg2};
+    const bool MayThrow = false;
+    Value *Pair = makeCall(Intrinsic, MayThrow, Args).getInstruction();
 
     // Extract the bool and raise an overflow exception if set.
     Value *OvfBool = LLVMBuilder->CreateExtractValue(Pair, 1, "Ovf");
@@ -2963,7 +3006,9 @@ void GenIR::storePrimitiveType(IRNode *Value, IRNode *Addr,
   ASSERTNR(isPrimitiveType(CorInfoType));
 
   uint32_t Align;
-  IRNode *TypedAddr = getPrimitiveAddress(Addr, CorInfoType, Alignment, &Align);
+  const CORINFO_CLASS_HANDLE ClassHandle = nullptr;
+  IRNode *TypedAddr =
+      getTypedAddress(Addr, CorInfoType, ClassHandle, Alignment, &Align);
   Type *ExpectedTy =
       cast<PointerType>(TypedAddr->getType())->getPointerElementType();
   IRNode *ValueToStore = convertFromStackType(Value, CorInfoType, ExpectedTy);
@@ -3032,6 +3077,13 @@ LoadInst *GenIR::makeLoad(Value *Address, bool IsVolatile,
   }
 
   return LLVMBuilder->CreateLoad(Address, IsVolatile);
+}
+
+CallSite GenIR::makeCall(Value *Callee, bool MayThrow, ArrayRef<Value *> Args) {
+  if (MayThrow) {
+    // TODO: Generate an invoke with an appropriate unwind label.
+  }
+  return LLVMBuilder->CreateCall(Callee, Args);
 }
 
 void GenIR::storeStaticField(CORINFO_RESOLVED_TOKEN *FieldToken,
@@ -3200,8 +3252,10 @@ IRNode *GenIR::loadElemA(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Index,
   if (!IsReadOnly && ((ClassAttribs & CORINFO_FLG_VALUECLASS) == 0)) {
     IRNode *HandleNode = genericTokenToNode(ResolvedToken);
     PointerType *ElementAddressTy = getManagedPointerType(ElementTy);
-    return callHelperImpl(CORINFO_HELP_LDELEMA_REF, ElementAddressTy, Array,
-                          Index, HandleNode);
+    const bool MayThrow = true;
+    return (IRNode *)callHelperImpl(CORINFO_HELP_LDELEMA_REF, MayThrow,
+                                    ElementAddressTy, Array, Index,
+                                    HandleNode).getInstruction();
   }
 
   return genArrayElemAddress(Array, Index, ElementTy);
@@ -3369,21 +3423,23 @@ bool isNonVolatileWriteHelperCall(CorInfoHelpFunc HelperId) {
 }
 
 // Generate call to helper
-IRNode *GenIR::callHelper(CorInfoHelpFunc HelperID, IRNode *Dst, IRNode *Arg1,
-                          IRNode *Arg2, IRNode *Arg3, IRNode *Arg4,
-                          ReaderAlignType Alignment, bool IsVolatile,
-                          bool NoCtor, bool CanMoveUp) {
+IRNode *GenIR::callHelper(CorInfoHelpFunc HelperID, bool MayThrow, IRNode *Dst,
+                          IRNode *Arg1, IRNode *Arg2, IRNode *Arg3,
+                          IRNode *Arg4, ReaderAlignType Alignment,
+                          bool IsVolatile, bool NoCtor, bool CanMoveUp) {
   LLVMContext &LLVMContext = *this->JitContext->LLVMContext;
   Type *ReturnType =
       (Dst == nullptr) ? Type::getVoidTy(LLVMContext) : Dst->getType();
-  return callHelperImpl(HelperID, ReturnType, Arg1, Arg2, Arg3, Arg4, Alignment,
-                        IsVolatile, NoCtor, CanMoveUp);
+  return (IRNode *)callHelperImpl(HelperID, MayThrow, ReturnType, Arg1, Arg2,
+                                  Arg3, Arg4, Alignment, IsVolatile, NoCtor,
+                                  CanMoveUp).getInstruction();
 }
 
-IRNode *GenIR::callHelperImpl(CorInfoHelpFunc HelperID, Type *ReturnType,
-                              IRNode *Arg1, IRNode *Arg2, IRNode *Arg3,
-                              IRNode *Arg4, ReaderAlignType Alignment,
-                              bool IsVolatile, bool NoCtor, bool CanMoveUp) {
+CallSite GenIR::callHelperImpl(CorInfoHelpFunc HelperID, bool MayThrow,
+                               Type *ReturnType, IRNode *Arg1, IRNode *Arg2,
+                               IRNode *Arg3, IRNode *Arg4,
+                               ReaderAlignType Alignment, bool IsVolatile,
+                               bool NoCtor, bool CanMoveUp) {
   ASSERT(HelperID != CORINFO_HELP_UNDEF);
 
   // TODO: We can turn some of these helper calls into intrinsics.
@@ -3430,7 +3486,7 @@ IRNode *GenIR::callHelperImpl(CorInfoHelpFunc HelperID, Type *ReturnType,
 
   // This is an intermediate result. Callers must handle
   // transitioning to a valid stack type, if appropriate.
-  IRNode *Call = (IRNode *)LLVMBuilder->CreateCall(Target, Arguments);
+  CallSite Call = makeCall(Target, MayThrow, Arguments);
 
   if (IsVolatile && isNonVolatileWriteHelperCall(HelperID)) {
     // TODO: this is only needed where CLRConfig::INTERNAL_JitLockWrite is set
@@ -3467,7 +3523,9 @@ IRNode *GenIR::callRuntimeHandleHelper(CorInfoHelpFunc Helper, IRNode *Arg1,
 
   // Call the helper unconditionally if NullCheckArg is null.
   if ((NullCheckArg == nullptr) || isConstantNull(NullCheckArg)) {
-    return callHelperImpl(Helper, ReturnType, Arg1, Arg2);
+    const bool MayThrow = true;
+    return (IRNode *)callHelperImpl(Helper, MayThrow, ReturnType, Arg1, Arg2)
+        .getInstruction();
   }
 
   BasicBlock *SaveBlock = LLVMBuilder->GetInsertBlock();
@@ -3476,10 +3534,11 @@ IRNode *GenIR::callRuntimeHandleHelper(CorInfoHelpFunc Helper, IRNode *Arg1,
   Value *Compare = LLVMBuilder->CreateIsNull(NullCheckArg, "NullCheck");
 
   // Generate conditional helper call.
-  bool CallReturns = true;
-  CallInst *HelperCall =
-      genConditionalHelperCall(Compare, Helper, ReturnType, Arg1, Arg2,
-                               CallReturns, "RuntimeHandleHelperCall");
+  const bool MayThrow = true;
+  const bool CallReturns = true;
+  CallSite HelperCall =
+      genConditionalHelperCall(Compare, Helper, MayThrow, ReturnType, Arg1,
+                               Arg2, CallReturns, "RuntimeHandleHelperCall");
 
   // The result is a PHI of NullCheckArg and the generated call.
   // The generated code is equivalent to
@@ -3490,9 +3549,9 @@ IRNode *GenIR::callRuntimeHandleHelper(CorInfoHelpFunc Helper, IRNode *Arg1,
   // return x;
   BasicBlock *CurrentBlock = LLVMBuilder->GetInsertBlock();
   BasicBlock *CallBlock = HelperCall->getParent();
-  PHINode *PHI =
-      mergeConditionalResults(CurrentBlock, NullCheckArg, SaveBlock, HelperCall,
-                              CallBlock, "RuntimeHandle");
+  PHINode *PHI = mergeConditionalResults(CurrentBlock, NullCheckArg, SaveBlock,
+                                         HelperCall.getInstruction(), CallBlock,
+                                         "RuntimeHandle");
   return (IRNode *)PHI;
 }
 
@@ -3513,11 +3572,12 @@ IRNode *GenIR::convertHandle(IRNode *GetTokenNumericNode,
   // Get the value that should be assigned to the struct's field, e.g., an
   // instance of RuntimeType.
   Type *HelperResultType = FieldAddress->getType()->getPointerElementType();
-  IRNode *HelperResult =
-      callHelperImpl(HelperID, HelperResultType, GetTokenNumericNode);
+  const bool MayThrow = true;
+  CallSite HelperResult =
+      callHelperImpl(HelperID, MayThrow, HelperResultType, GetTokenNumericNode);
 
   // Assign the field of the result struct.
-  LLVMBuilder->CreateStore(HelperResult, FieldAddress);
+  LLVMBuilder->CreateStore(HelperResult.getInstruction(), FieldAddress);
 
   const bool IsVolatile = false;
   return (IRNode *)LLVMBuilder->CreateLoad(Result, IsVolatile);
@@ -3619,7 +3679,8 @@ IRNode *GenIR::genNewMDArrayCall(ReaderCallTargetData *CallTargetData,
                                        getUnmanagedPointerType(FunctionType));
 
   // Replace the old call instruction with the new one.
-  *CallNode = (IRNode *)LLVMBuilder->CreateCall(Callee, Arguments);
+  const bool MayThrow = true;
+  *CallNode = (IRNode *)makeCall(Callee, MayThrow, Arguments).getInstruction();
   return *CallNode;
 }
 
@@ -3671,8 +3732,10 @@ IRNode *GenIR::genNewObjThisArg(ReaderCallTargetData *CallTargetData,
 
   // Create the address operand for the newobj helper.
   CorInfoHelpFunc HelperId = getNewHelper(CallTargetData->getResolvedToken());
+  const bool MayThrow = true;
   Value *ThisPointer =
-      callHelperImpl(HelperId, ThisType, CallTargetData->getClassHandleNode());
+      callHelperImpl(HelperId, MayThrow, ThisType,
+                     CallTargetData->getClassHandleNode()).getInstruction();
   return (IRNode *)ThisPointer;
 }
 
@@ -3703,7 +3766,7 @@ IRNode *GenIR::genNewObjReturnNode(ReaderCallTargetData *CallTargetData,
   return ThisArg;
 }
 
-IRNode *GenIR::genCall(ReaderCallTargetData *CallTargetInfo,
+IRNode *GenIR::genCall(ReaderCallTargetData *CallTargetInfo, bool MayThrow,
                        std::vector<IRNode *> Args, IRNode **CallNode) {
   IRNode *Call = nullptr, *ReturnNode = nullptr;
   IRNode *TargetNode = CallTargetInfo->getCallTargetNode();
@@ -3782,7 +3845,7 @@ IRNode *GenIR::genCall(ReaderCallTargetData *CallTargetInfo,
 
   ABICallSignature ABICallSig(Signature, *this, *JitContext->TheABIInfo);
   Value *ResultNode = ABICallSig.emitCall(
-      *this, (Value *)TargetNode, Arguments,
+      *this, (Value *)TargetNode, MayThrow, Arguments,
       (Value *)CallTargetInfo->getIndirectionCellNode(), (Value **)&Call);
 
   // Add VarArgs cookie to outgoing param list
@@ -3874,7 +3937,9 @@ Value *GenIR::genConvertOverflowCheck(Value *Source, IntegerType *TargetTy,
     }
 
     // Call the helper to convert to int.
-    Source = callHelperImpl(Helper, HelperResultTy, (IRNode *)Source);
+    const bool MayThrow = true;
+    Source = callHelperImpl(Helper, MayThrow, HelperResultTy, (IRNode *)Source)
+                 .getInstruction();
     SourceTy = HelperResultTy;
 
     // The result of the helper call already has the requested signedness.
@@ -4237,44 +4302,56 @@ bool GenIR::fgOptRecurse(mdToken Token) {
   return true;
 }
 
-void GenIR::returnOpcode(IRNode *Opr, bool IsSynchronousMethod) {
+void GenIR::returnOpcode(IRNode *Opr, bool IsSynchronizedMethod) {
   const ABIArgInfo &ResultInfo = ABIMethodSig.getResultInfo();
   const CallArgType &ResultArgType = MethodSignature.getResultType();
   CorInfoType ResultCorType = ResultArgType.CorType;
+  Value *ResultValue = nullptr;
+  bool IsVoidReturn = ResultCorType == CORINFO_TYPE_VOID;
 
-  if (ResultCorType == CORINFO_TYPE_VOID) {
+  if (IsVoidReturn) {
     assert(Opr == nullptr);
     assert(ResultInfo.getType()->isVoidTy());
-    LLVMBuilder->CreateRetVoid();
-    return;
-  }
-
-  assert(Opr != nullptr);
-
-  Value *ResultValue = nullptr;
-  if (ResultInfo.getKind() == ABIArgInfo::Indirect) {
-    Type *ResultTy = ResultInfo.getType();
-    ResultValue = convertFromStackType(Opr, ResultCorType, ResultTy);
-
-    CORINFO_CLASS_HANDLE ResultClass = ResultArgType.Class;
-    if (JitContext->JitInfo->isStructRequiringStackAllocRetBuf(ResultClass) ==
-        TRUE) {
-      // The return buffer must be on the stack; a simple store will suffice.
-      LLVMBuilder->CreateStore(ResultValue, IndirectResult);
-    } else {
-      const bool IsVolatile = false;
-      storeIndirectArg(ResultArgType, ResultValue, IndirectResult, IsVolatile);
-    }
-
-    ResultValue = IndirectResult;
   } else {
-    Type *ResultTy = getType(ResultCorType, ResultArgType.Class);
-    ResultValue = convertFromStackType(Opr, ResultCorType, ResultTy);
-    ResultValue =
-        ABISignature::coerce(*this, ResultInfo.getType(), ResultValue);
+    assert(Opr != nullptr);
+
+    if (ResultInfo.getKind() == ABIArgInfo::Indirect) {
+      Type *ResultTy = ResultInfo.getType();
+      ResultValue = convertFromStackType(Opr, ResultCorType, ResultTy);
+
+      CORINFO_CLASS_HANDLE ResultClass = ResultArgType.Class;
+      if (JitContext->JitInfo->isStructRequiringStackAllocRetBuf(ResultClass) ==
+          TRUE) {
+        // The return buffer must be on the stack; a simple store will suffice.
+        LLVMBuilder->CreateStore(ResultValue, IndirectResult);
+      } else {
+        const bool IsVolatile = false;
+        storeIndirectArg(ResultArgType, ResultValue, IndirectResult,
+                         IsVolatile);
+      }
+
+      ResultValue = IndirectResult;
+    } else {
+      Type *ResultTy = getType(ResultCorType, ResultArgType.Class);
+      ResultValue = convertFromStackType(Opr, ResultCorType, ResultTy);
+      ResultValue =
+          ABISignature::coerce(*this, ResultInfo.getType(), ResultValue);
+    }
   }
 
-  LLVMBuilder->CreateRet(ResultValue);
+  // If the method is synchronized, then we must insert a call to MONITOR_EXIT
+  // before returning. The call to MONITOR_EXIT must occur after the return
+  // value has been calculated.
+  if (IsSynchronizedMethod) {
+    const bool IsEnter = false;
+    callMonitorHelper(IsEnter);
+  }
+
+  if (IsVoidReturn) {
+    LLVMBuilder->CreateRetVoid();
+  } else {
+    LLVMBuilder->CreateRet(ResultValue);
+  }
 }
 
 bool GenIR::needSequencePoints() { return false; }
@@ -4327,7 +4404,10 @@ IRNode *GenIR::unbox(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Object,
 
   // Call helper to do the type check and get the address of the unbox payload.
   Type *PtrTy = getType(CorInfoType::CORINFO_TYPE_BYREF, ClassHandle);
-  IRNode *Result = callHelperImpl(HelperId, PtrTy, ClassHandleArgument, Object);
+  const bool MayThrow = true;
+  IRNode *Result =
+      (IRNode *)callHelperImpl(HelperId, MayThrow, PtrTy, ClassHandleArgument,
+                               Object).getInstruction();
 
   // If requested, load the object onto the evaluation stack.
   if (AndLoad) {
@@ -4372,26 +4452,26 @@ void GenIR::switchOpcode(IRNode *Opr) {
 void GenIR::throwOpcode(IRNode *Arg1) {
   // Using a call for now; this will need to be invoke
   // when we get EH flow properly modeled.
-  CallInst *ThrowCall =
-      (CallInst *)callHelper(CORINFO_HELP_THROW, nullptr, Arg1);
+  Type *Void = Type::getVoidTy(*JitContext->LLVMContext);
+  const bool MayThrow = true;
+  CallSite ThrowCall = callHelperImpl(CORINFO_HELP_THROW, MayThrow, Void, Arg1);
 
   // Annotate the helper
-  ThrowCall->setDoesNotReturn();
+  ThrowCall.setDoesNotReturn();
 }
 
-CallInst *GenIR::genConditionalHelperCall(Value *Condition,
-                                          CorInfoHelpFunc HelperId,
-                                          Type *ReturnType, IRNode *Arg1,
-                                          IRNode *Arg2, bool CallReturns,
-                                          const Twine &CallBlockName) {
+CallSite GenIR::genConditionalHelperCall(
+    Value *Condition, CorInfoHelpFunc HelperId, bool MayThrow, Type *ReturnType,
+    IRNode *Arg1, IRNode *Arg2, bool CallReturns, const Twine &CallBlockName) {
   // Create the call block and fill it in.
   BasicBlock *CallBlock = createPointBlock(CallBlockName);
   IRBuilder<>::InsertPoint SavedInsertPoint = LLVMBuilder->saveIP();
   LLVMBuilder->SetInsertPoint(CallBlock);
-  CallInst *HelperCall =
-      (CallInst *)callHelperImpl(HelperId, ReturnType, Arg1, Arg2);
+  CallSite HelperCall =
+      callHelperImpl(HelperId, MayThrow, ReturnType, Arg1, Arg2);
+
   if (!CallReturns) {
-    HelperCall->setDoesNotReturn();
+    HelperCall.setDoesNotReturn();
     LLVMBuilder->CreateUnreachable();
   }
   LLVMBuilder->restoreIP(SavedInsertPoint);
@@ -4408,9 +4488,10 @@ void GenIR::genConditionalThrow(Value *Condition, CorInfoHelpFunc HelperId,
                                 const Twine &ThrowBlockName) {
   IRNode *Arg1 = nullptr, *Arg2 = nullptr;
   Type *ReturnType = Type::getVoidTy(*JitContext->LLVMContext);
-  bool CallReturns = false;
-  genConditionalHelperCall(Condition, HelperId, ReturnType, Arg1, Arg2,
-                           CallReturns, ThrowBlockName);
+  const bool MayThrow = true;
+  const bool CallReturns = false;
+  genConditionalHelperCall(Condition, HelperId, MayThrow, ReturnType, Arg1,
+                           Arg2, CallReturns, ThrowBlockName);
 }
 
 IRNode *GenIR::genNullCheck(IRNode *Node) {
@@ -4739,20 +4820,21 @@ IRNode *GenIR::derefAddress(IRNode *Address, bool DstIsGCPtr, bool IsConst,
 // Create an empty block to hold IR for some conditional instructions at a
 // particular point in the MSIL (conditional LLVM instructions that are part
 // of the expansion of a single MSIL instruction)
-BasicBlock *GenIR::createPointBlock(const Twine &BlockName) {
+BasicBlock *GenIR::createPointBlock(uint32_t PointOffset,
+                                    const Twine &BlockName) {
   BasicBlock *Block =
       BasicBlock::Create(*JitContext->LLVMContext, BlockName, Function);
 
-  // Give the call block equal start and end offsets so subsequent processing
+  // Give the point block equal start and end offsets so subsequent processing
   // won't try to translate MSIL into it.
-  FlowGraphNode *CallFlowGraphNode = (FlowGraphNode *)Block;
-  fgNodeSetStartMSILOffset(CallFlowGraphNode, CurrInstrOffset);
-  fgNodeSetEndMSILOffset(CallFlowGraphNode, CurrInstrOffset);
+  FlowGraphNode *PointFlowGraphNode = (FlowGraphNode *)Block;
+  fgNodeSetStartMSILOffset(PointFlowGraphNode, PointOffset);
+  fgNodeSetEndMSILOffset(PointFlowGraphNode, PointOffset);
 
   // Point blocks don't need an operand stack: they don't have any MSIL and
   // any successor block will get the stack propagated from the other
   // predecessor.
-  fgNodeSetPropagatesOperandStack(CallFlowGraphNode, false);
+  fgNodeSetPropagatesOperandStack(PointFlowGraphNode, false);
 
   return Block;
 }
@@ -4787,14 +4869,29 @@ BasicBlock *GenIR::splitCurrentBlock(TerminatorInst **Goto) {
   Instruction *NextInstruction =
       (InsertPoint == CurrentBlock->end() ? nullptr
                                           : (Instruction *)InsertPoint);
+  uint32_t CurrentEndOffset =
+      fgNodeGetEndMSILOffset((FlowGraphNode *)CurrentBlock);
+  uint32_t SplitOffset;
 
-  // Note that we split at offset NextInstrOffset rather than CurrInstrOffset.
-  // We're already generating the IR for the instr at CurrInstrOffset, and using
-  // NextInstrOffset here ensures that we won't redundantly try to add this
-  // instruction again when processing moves to NewBlock.
-  BasicBlock *NewBlock =
-      ReaderBase::fgSplitBlock((FlowGraphNode *)CurrentBlock, NextInstrOffset,
-                               (IRNode *)NextInstruction);
+  if (CurrentEndOffset >= NextInstrOffset) {
+    // Split at offset NextInstrOffset rather than CurrInstrOffset.  We're
+    // already generating the IR for the instr at CurrInstrOffset, and using
+    // NextInstrOffset here ensures that we won't redundantly try to add this
+    // instruction again when processing moves to NewBlock.
+
+    SplitOffset = NextInstrOffset;
+  } else {
+    // It may be the case that we're splitting a point block, whose point is
+    // CurrInstrOffset rather than NextInstrOffset.  In that case, give the new
+    // point block the same point as the old one, to ensure that the "split"
+    // operation never produces a block whose IL offset range isn't contained
+    // in the original block's range.
+
+    assert(CurrentEndOffset == CurrInstrOffset);
+    SplitOffset = CurrentEndOffset;
+  }
+  BasicBlock *NewBlock = ReaderBase::fgSplitBlock(
+      (FlowGraphNode *)CurrentBlock, SplitOffset, (IRNode *)NextInstruction);
 
   if (Goto != nullptr) {
     // Report the created goto to the caller
@@ -4882,16 +4979,17 @@ IRNode *GenIR::loadVirtFunc(IRNode *Arg1, CORINFO_RESOLVED_TOKEN *ResolvedToken,
 
   Type *Ty =
       Type::getIntNTy(*this->JitContext->LLVMContext, TargetPointerSizeInBits);
-  IRNode *CodeAddress = callHelperImpl(CORINFO_HELP_VIRTUAL_FUNC_PTR, Ty, Arg1,
-                                       TypeToken, MethodToken);
+  const bool MayThrow = true;
+  IRNode *CodeAddress =
+      (IRNode *)callHelperImpl(CORINFO_HELP_VIRTUAL_FUNC_PTR, MayThrow, Ty,
+                               Arg1, TypeToken, MethodToken).getInstruction();
 
   return CodeAddress;
 }
 
-IRNode *GenIR::getPrimitiveAddress(IRNode *Addr, CorInfoType CorInfoType,
-                                   ReaderAlignType Alignment, uint32_t *Align) {
-  ASSERTNR(isPrimitiveType(CorInfoType) || CorInfoType == CORINFO_TYPE_REFANY);
-
+IRNode *GenIR::getTypedAddress(IRNode *Addr, CorInfoType CorInfoType,
+                               CORINFO_CLASS_HANDLE ClassHandle,
+                               ReaderAlignType Alignment, uint32_t *Align) {
   // Get type of the result.
   Type *AddressTy = Addr->getType();
   IRNode *TypedAddr = Addr;
@@ -4916,8 +5014,8 @@ IRNode *GenIR::getPrimitiveAddress(IRNode *Addr, CorInfoType CorInfoType,
     // GC pointers are always naturally aligned
     Alignment = Reader_AlignNatural;
   } else {
-    // For the true primitve case we may need to cast the address.
-    Type *ExpectedTy = this->getType(CorInfoType, nullptr);
+    // For other cases we may need to cast the address.
+    Type *ExpectedTy = this->getType(CorInfoType, ClassHandle);
     PointerType *PointerTy = dyn_cast<PointerType>(AddressTy);
     if (PointerTy != nullptr) {
       Type *ReferentTy = PointerTy->getPointerElementType();
@@ -4943,12 +5041,28 @@ IRNode *GenIR::loadPrimitiveType(IRNode *Addr, CorInfoType CorInfoType,
                                  ReaderAlignType Alignment, bool IsVolatile,
                                  bool IsInterfReadOnly, bool AddressMayBeNull) {
   uint32_t Align;
-  IRNode *TypedAddr = getPrimitiveAddress(Addr, CorInfoType, Alignment, &Align);
+  const CORINFO_CLASS_HANDLE ClassHandle = nullptr;
+  IRNode *TypedAddr =
+      getTypedAddress(Addr, CorInfoType, ClassHandle, Alignment, &Align);
   LoadInst *LoadInst = makeLoad(TypedAddr, IsVolatile, AddressMayBeNull);
   LoadInst->setAlignment(Align);
 
   return convertToStackType((IRNode *)LoadInst, CorInfoType);
 }
+
+IRNode *GenIR::loadNonPrimitiveObj(IRNode *Addr,
+                                   CORINFO_CLASS_HANDLE ClassHandle,
+                                   ReaderAlignType Alignment, bool IsVolatile,
+                                   bool AddressMayBeNull) {
+  uint32_t Align;
+  CorInfoType CorType = JitContext->JitInfo->asCorInfoType(ClassHandle);
+  IRNode *TypedAddr =
+      getTypedAddress(Addr, CorType, ClassHandle, Alignment, &Align);
+  LoadInst *LoadInst = makeLoad(TypedAddr, IsVolatile, AddressMayBeNull);
+  LoadInst->setAlignment(Align);
+
+  return (IRNode *)LoadInst;
+};
 
 void GenIR::classifyCmpType(Type *Ty, uint32_t &Size, bool &IsPointer,
                             bool &IsFloat) {
@@ -5274,8 +5388,9 @@ IRNode *GenIR::newArr(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Arg1) {
       getType(CorInfoType::CORINFO_TYPE_CLASS, ResolvedToken->hClass);
   Value *Destination = Constant::getNullValue(ArrayType);
 
-  return callHelper(getNewArrHelper(ElementType), (IRNode *)Destination, Token,
-                    NumOfElements);
+  const bool MayThrow = true;
+  return callHelper(getNewArrHelper(ElementType), MayThrow,
+                    (IRNode *)Destination, Token, NumOfElements);
 }
 
 // CastOp - Generates code for castclass or isinst.
@@ -5327,9 +5442,11 @@ IRNode *GenIR::castOp(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *ObjRefNode,
   // Generate the helper call or intrinsic
   const bool IsVolatile = false;
   const bool DoesNotInvokeStaticCtor = Optimize;
-  return callHelperImpl(HelperId, ResultType, ClassHandleNode, ObjRefNode,
-                        nullptr, nullptr, Reader_AlignUnknown, IsVolatile,
-                        DoesNotInvokeStaticCtor);
+  const bool MayThrow = true;
+  return (IRNode *)callHelperImpl(HelperId, MayThrow, ResultType,
+                                  ClassHandleNode, ObjRefNode, nullptr, nullptr,
+                                  Reader_AlignUnknown, IsVolatile,
+                                  DoesNotInvokeStaticCtor).getInstruction();
 }
 
 // Override the cast class optimization
@@ -5355,12 +5472,37 @@ bool GenIR::abs(IRNode *Argument, IRNode **Result) {
     Type *Types[] = {Ty};
     Value *FAbs = Intrinsic::getDeclaration(JitContext->CurrentModule,
                                             Intrinsic::fabs, Types);
-    Value *Abs = LLVMBuilder->CreateCall(FAbs, Argument);
+    bool MayThrow = false;
+    Value *Abs = makeCall(FAbs, MayThrow, Argument).getInstruction();
     *Result = (IRNode *)Abs;
     return true;
   }
 
   return false;
+}
+
+IRNode *GenIR::localAlloc(IRNode *Arg, bool ZeroInit) {
+  // Note that we've seen a localloc in this method, since it has repercussions
+  // on other aspects of code generation.
+  this->HasLocAlloc = true;
+
+  // Arg is the number of bytes to allocate. Result must be pointer-aligned.
+  const unsigned int Alignment = TargetPointerSizeInBits / 8;
+  LLVMContext &Context = *JitContext->LLVMContext;
+  Type *Ty = Type::getInt8Ty(Context);
+  AllocaInst *LocAlloc = LLVMBuilder->CreateAlloca(Ty, Arg, "LocAlloc");
+  LocAlloc->setAlignment(Alignment);
+
+  // Zero the allocated region if so requested.
+  if (ZeroInit) {
+    const bool MayThrow = false;
+    Type *VoidTy = Type::getVoidTy(Context);
+    Value *ZeroByte = ConstantInt::get(Context, APInt(8, 0, true));
+    callHelperImpl(CORINFO_HELP_MEMSET, MayThrow, VoidTy, (IRNode *)LocAlloc,
+                   (IRNode *)ZeroByte, Arg);
+  }
+
+  return (IRNode *)LocAlloc;
 }
 
 #pragma endregion
@@ -5400,15 +5542,20 @@ void GenIR::maintainOperandStack(FlowGraphNode *CurrentBlock) {
     FlowGraphNode *SuccessorBlock = fgEdgeListGetSink(SuccessorList);
 
     if (!fgNodeHasMultiplePredsPropagatingStack(SuccessorBlock)) {
-      // The current node is the only relevant predecessor of this Successor.
-      ASSERTNR(fgNodePropagatesOperandStack(CurrentBlock));
       // We need to create a stack for the Successor and copy the items from the
       // current stack.
       if (!fgNodePropagatesOperandStack(SuccessorBlock)) {
         // This successor block doesn't need a stack. This is a common case for
         // implicit exception throw blocks or conditional helper calls.
       } else {
-        fgNodeSetOperandStack(SuccessorBlock, ReaderOperandStack->copy());
+        // The current node is the only relevant predecessor of this Successor.
+        if (fgNodePropagatesOperandStack(CurrentBlock)) {
+          fgNodeSetOperandStack(SuccessorBlock, ReaderOperandStack->copy());
+        } else {
+          // The successor block starts with empty stack.
+          assert(fgNodeHasNoPredsPropagatingStack(SuccessorBlock));
+          fgNodeSetOperandStack(SuccessorBlock, createStack());
+        }
       }
     } else {
       ReaderStack *SuccessorStack = fgNodeGetOperandStack(SuccessorBlock);
@@ -5417,10 +5564,7 @@ void GenIR::maintainOperandStack(FlowGraphNode *CurrentBlock) {
         // We need to create a new stack for the Successor and populate it
         // with PHI instructions corresponding to the values on the current
         // stack.
-        SuccessorStack =
-            createStack(std::min(MethodInfo->maxStack,
-                                 std::min(100U, MethodInfo->ILCodeSize)),
-                        this);
+        SuccessorStack = createStack();
         fgNodeSetOperandStack(SuccessorBlock, SuccessorStack);
         CreatePHIs = true;
       }

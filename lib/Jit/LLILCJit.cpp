@@ -45,29 +45,17 @@
 
 using namespace llvm;
 
-// Get the LLVM IR dump level. For now this is done by directly
-// accessing environment variable. When CLR config support is
-// included, update it here.
-LLVMDumpLevel dumpLevel() {
-  const char *LevelCStr = getenv("DUMPLLVMIR");
-  if (LevelCStr) {
-    std::string Level = LevelCStr;
-    std::transform(Level.begin(), Level.end(), Level.begin(), ::toupper);
-    if (Level.compare("VERBOSE") == 0) {
-      return VERBOSE;
-    }
-    if (Level.compare("SUMMARY") == 0) {
-      return SUMMARY;
-    }
-  }
-  return NODUMP;
-}
-
 // Get the GC-Scheme used by the runtime -- conservative/precise
 // For now this is done by directly accessing environment variable.
 // When CLR config support is included, update it here.
 bool shouldUseConservativeGC() {
   const char *LevelCStr = getenv("COMPLUS_GCCONSERVATIVE");
+  return (LevelCStr != nullptr) && (strcmp(LevelCStr, "1") == 0);
+}
+
+// Determine if GC statepoints should be inserted.
+bool shouldInsertStatepoints() {
+  const char *LevelCStr = getenv("COMPLUS_INSERTSTATEPOINTS");
   return (LevelCStr != nullptr) && (strcmp(LevelCStr, "1") == 0);
 }
 
@@ -102,7 +90,9 @@ LLILCJit::LLILCJit() {
   InitializeNativeTargetAsmParser();
   llvm::linkStatepointExampleGC();
 
-  ShouldUseConservativeGC = shouldUseConservativeGC();
+  ShouldInsertStatepoints = shouldInsertStatepoints();
+  assert(ShouldInsertStatepoints ||
+         shouldUseConservativeGC() && "Statepoints required for precise-GC");
 }
 
 #ifdef LLVM_ON_WIN32
@@ -180,7 +170,7 @@ CorJitResult LLILCJit::compileMethod(ICorJitInfo *JitInfo,
   Context.LLVMContext = &PerThreadState->LLVMContext;
   std::unique_ptr<Module> M = Context.getModuleForMethod(MethodInfo);
   Context.CurrentModule = M.get();
-  Context.CurrentModule->setTargetTriple(LLVM_DEFAULT_TARGET_TRIPLE);
+  Context.CurrentModule->setTargetTriple(LLILC_TARGET_TRIPLE);
   Context.TheABIInfo = ABIInfo::get(*Context.CurrentModule);
 
   // Initialize per invocation JIT options. This should be done after the
@@ -216,6 +206,8 @@ CorJitResult LLILCJit::compileMethod(ICorJitInfo *JitInfo,
     return CORJIT_INTERNALERROR;
   }
 
+  // Don't allow the EE to search for external symbols.
+  NewEngine->DisableSymbolSearching();
   Context.EE = NewEngine;
 
   // Now jit the method.
@@ -227,7 +219,7 @@ CorJitResult LLILCJit::compileMethod(ICorJitInfo *JitInfo,
 
   if (HasMethod) {
 
-    if (!ShouldUseConservativeGC) {
+    if (ShouldInsertStatepoints) {
       // If using Precise GC, run the GC-Safepoint insertion
       // and lowering passes before generating code.
       legacy::PassManager Passes;
@@ -401,13 +393,15 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
   Function *Func = JitContext->CurrentModule->getFunction(FuncName);
   bool IsOk = !verifyFunction(*Func, &dbgs());
 
+  assert(IsOk);
+
   if (IsOk) {
     if (DumpLevel >= SUMMARY) {
       errs() << "Successfully read " << FuncName << '\n';
     }
   } else {
     if (DumpLevel >= SUMMARY) {
-      errs() << "Failed to read " << FuncName << '[' << "verification error" << "]\n";
+      errs() << "Failed to read " << FuncName << "[verification error]\n";
     }
     return false;
   }
