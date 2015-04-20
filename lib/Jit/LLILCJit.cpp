@@ -393,7 +393,7 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
   Function *Func = JitContext->CurrentModule->getFunction(FuncName);
   bool IsOk = !verifyFunction(*Func, &dbgs());
 
-  assert(IsOk);
+  //assert(IsOk);
 
   if (IsOk) {
     if (DumpLevel >= SUMMARY) {
