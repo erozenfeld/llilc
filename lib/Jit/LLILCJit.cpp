@@ -381,6 +381,10 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
     }
   }
 
+  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.CSharp.Syntax.InternalSyntax.Lexer..cctor")) {
+    printf("here");
+  }
+
   try {
     Reader.msilToIR();
   } catch (NotYetImplementedException &Nyi) {
@@ -393,7 +397,7 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
   Function *Func = JitContext->CurrentModule->getFunction(FuncName);
   bool IsOk = !verifyFunction(*Func, &dbgs());
 
-  //assert(IsOk);
+  assert(IsOk);
 
   if (IsOk) {
     if (DumpLevel >= SUMMARY) {
