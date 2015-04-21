@@ -5659,7 +5659,6 @@ Value *GenIR::ChangePHIOperandType(Value *Operand, BasicBlock *OperandBlock,
       assert(isUnmanagedPointerType(OperandTy));
       return LLVMBuilder->CreatePtrToInt(Operand, NewTy);
     }
-    }
   } else if (NewTy->isFloatingPointTy()) {
     return LLVMBuilder->CreateFPCast(Operand, NewTy);
   } else {
