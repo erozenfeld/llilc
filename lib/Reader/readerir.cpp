@@ -1305,7 +1305,7 @@ Type *GenIR::getClassType(CORINFO_CLASS_HANDLE ClassHandle, bool IsRefClass,
       // causes trouble with certain recursive type graphs, for example:
       //
       // class A { B b; }
-      // class B : extends A { int c };
+      // class B : extends A { int c; }
       //
       // We need to know the size of A before we can finish B. So we can't
       // ask for B's details while filling out A.
@@ -1405,11 +1405,18 @@ Type *GenIR::getClassType(CORINFO_CLASS_HANDLE ClassHandle, bool IsRefClass,
     }
   }
 
+  // It's possible that while adding the fields to this struct we already
+  // completed the struct. For example:
+  // class A { B b; }
+  // struct B { A a; }
+  // In that case we are already done.
+  if (!StructTy->isOpaque()) {
+    return ResultTy;
+  }
+
   // Install the field list (even if empty) to complete the struct.
   // Since padding is explicit, this is an LLVM packed struct.
-  if (StructTy->isOpaque()) {
-    StructTy->setBody(Fields, true /* isPacked */);
-  }
+  StructTy->setBody(Fields, true /* isPacked */);
 
   // For value classes we can do further checking and validate
   // against the runtime's view of the class.
