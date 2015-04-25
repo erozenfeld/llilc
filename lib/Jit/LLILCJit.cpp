@@ -319,7 +319,7 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
       !strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.CSharp.CodeGen.CodeGenerator.HandleReturn") ||
       !strcmp(FuncName.c_str(), "BasicBlock.SetBranchCode")
     ) {
-    if (DumpLevel >= SUMMARY) {
+    if (DumpLevel >= ::DumpLevel::SUMMARY) {
       errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
     }
     return false;
