@@ -279,7 +279,7 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
     ASSERTNR(UNREACHED);
   }
 
-  if (LLILCJit::TheJit->ShouldInsertStatepoints) {
+  if (JitContext->Options->DoInsertStatepoints) {
     createSafepointPoll();
   }
 
@@ -294,6 +294,7 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
   }
 
   const uint32_t JitFlags = JitContext->Flags;
+
   bool HasSecretParameter = (JitFlags & CORJIT_FLG_PUBLISH_SECRET_PARAM) != 0;
 
   uint32_t NumLocals = 0;
@@ -319,6 +320,7 @@ void GenIR::readerPrePass(uint8_t *Buffer, uint32_t NumBytes) {
   LocalVarCorTypes.resize(NumLocals);
   KeepGenericContextAlive = false;
   NeedsSecurityObject = false;
+  DoneBuildingFlowGraph = false;
   UnreachableContinuationBlock = nullptr;
 
   initParamsAndAutos(MethodSignature);
@@ -452,7 +454,7 @@ void GenIR::readerPostPass(bool IsImportOnly) {
     insertIRForSecurityObject();
   }
 
-  if (LLILCJit::TheJit->ShouldInsertStatepoints) {
+  if (JitContext->Options->DoInsertStatepoints) {
 
     // Precise GC using statepoints cannot handle aggregates that contain
     // managed pointers yet. So, check if this function deals with such values
@@ -574,6 +576,100 @@ void GenIR::callMonitorHelper(bool IsEnter) {
   const bool MayThrow = false;
   callHelperImpl(HelperId, MayThrow, Type::getVoidTy(*JitContext->LLVMContext),
                  MethodSyncHandle, (IRNode *)SyncFlag);
+}
+
+void GenIR::insertIRForUnmanagedCallFrame() {
+  // There's nothing more to do if we've already inserted the necessary IR.
+  if (UnmanagedCallFrame != nullptr) {
+    assert(ThreadPointer != nullptr);
+    return;
+  }
+
+  const struct CORINFO_EE_INFO::InlinedCallFrameInfo &CallFrameInfo =
+      JitContext->EEInfo.inlinedCallFrameInfo;
+  LLVMContext &LLVMContext = *JitContext->LLVMContext;
+  Type *Int8Ty = Type::getInt8Ty(LLVMContext);
+  Type *Int32Ty = Type::getInt32Ty(LLVMContext);
+  Type *Int8PtrTy = getUnmanagedPointerType(Int8Ty);
+  IRBuilder<>::InsertPoint SavedInsertPoint = LLVMBuilder->saveIP();
+
+  // Mark this function as requiring a frame pointer and as using GC.
+  Function->addFnAttr("no-frame-pointer-elim-non-leaf");
+  Function->setGC("statepoint-example");
+
+  // The call frame data structure is modeled as an opaque blob of bytes.
+  Type *CallFrameTy = ArrayType::get(Int8Ty, CallFrameInfo.size);
+  Instruction *CallFrameAddress =
+      createTemporary(CallFrameTy, "InlinedCallFrame");
+
+  Type *ThreadPointerTy = getUnmanagedPointerType(ArrayType::get(Int8Ty, 0));
+  Instruction *ThreadPointerAddress =
+      createTemporary(ThreadPointerTy, "ThreadPointer");
+
+  // Intialize the call frame
+  LLVMBuilder->SetInsertPoint(ThreadPointerAddress->getNextNode());
+
+  // Argument 0: &InlinedCallFrame[CallFrameInfo.offsetOfFrameVptr]
+  Value *FrameVPtrIndices[] = {
+      ConstantInt::get(Int32Ty, 0),
+      ConstantInt::get(Int32Ty, CallFrameInfo.offsetOfFrameVptr)};
+  Value *FrameVPtrAddress =
+      LLVMBuilder->CreateInBoundsGEP(CallFrameAddress, FrameVPtrIndices);
+
+  // Argument 1: the secret parameter, if any
+  Value *SecretParam = nullptr;
+  if (MethodSignature.hasSecretParameter()) {
+    SecretParam = (Value *)secretParam();
+  } else {
+    SecretParam = Constant::getNullValue(Int8PtrTy);
+  }
+
+  // Call CORINFO_HELP_INIT_PINVOKE_FRAME
+  const bool MayThrow = false;
+  Value *ThreadPointerValue =
+      callHelperImpl(CORINFO_HELP_INIT_PINVOKE_FRAME, MayThrow, ThreadPointerTy,
+                     (IRNode *)FrameVPtrAddress,
+                     (IRNode *)SecretParam).getInstruction();
+  LLVMBuilder->CreateStore(ThreadPointerValue, ThreadPointerAddress);
+
+  // Store the stack and frame pointers
+  Type *RegType = Type::getIntNTy(LLVMContext, TargetPointerSizeInBits);
+  Type *ReadRegisterTypes[] = {RegType};
+  llvm::Function *ReadRegister = Intrinsic::getDeclaration(
+      JitContext->CurrentModule, Intrinsic::read_register, ReadRegisterTypes);
+
+  Value *CallSiteSPIndices[] = {
+      ConstantInt::get(Int32Ty, 0),
+      ConstantInt::get(Int32Ty, CallFrameInfo.offsetOfCallSiteSP)};
+  Value *CallSiteSPAddress =
+      LLVMBuilder->CreateInBoundsGEP(CallFrameAddress, CallSiteSPIndices);
+  CallSiteSPAddress = LLVMBuilder->CreatePointerCast(
+      CallSiteSPAddress, getUnmanagedPointerType(RegType));
+  MDString *SPName = MDString::get(LLVMContext, "rsp");
+  Metadata *SPNameNodeMDs[]{SPName};
+  MDNode *SPNameNode = MDNode::get(LLVMContext, SPNameNodeMDs);
+  Value *SPNameValue = MetadataAsValue::get(LLVMContext, SPNameNode);
+  Value *SPValue = LLVMBuilder->CreateCall(ReadRegister, SPNameValue);
+  LLVMBuilder->CreateStore(SPValue, CallSiteSPAddress);
+
+  Value *CalleeSavedFPIndices[] = {
+      ConstantInt::get(Int32Ty, 0),
+      ConstantInt::get(Int32Ty, CallFrameInfo.offsetOfCalleeSavedFP)};
+  Value *CalleeSavedFPAddress =
+      LLVMBuilder->CreateInBoundsGEP(CallFrameAddress, CalleeSavedFPIndices);
+  CalleeSavedFPAddress = LLVMBuilder->CreatePointerCast(
+      CalleeSavedFPAddress, getUnmanagedPointerType(RegType));
+  MDString *FPName = MDString::get(LLVMContext, "rbp");
+  Metadata *FPNameNodeMDs[]{FPName};
+  MDNode *FPNameNode = MDNode::get(LLVMContext, FPNameNodeMDs);
+  Value *FPNameValue = MetadataAsValue::get(LLVMContext, FPNameNode);
+  Value *FPValue = LLVMBuilder->CreateCall(ReadRegister, FPNameValue);
+  LLVMBuilder->CreateStore(FPValue, CalleeSavedFPAddress);
+
+  LLVMBuilder->restoreIP(SavedInsertPoint);
+
+  UnmanagedCallFrame = CallFrameAddress;
+  ThreadPointer = ThreadPointerAddress;
 }
 
 #pragma endregion
@@ -816,6 +912,8 @@ void GenIR::createSafepointPoll() {
   CallInst::Create(Target, "", EntryBlock);
   ReturnInst::Create(*LLVMContext, EntryBlock);
 }
+
+bool GenIR::doTailCallOpt() { return JitContext->Options->DoTailCallOpt; }
 
 #pragma endregion
 
@@ -1940,9 +2038,12 @@ FlowGraphNode *GenIR::fgGetTailBlock() {
 }
 
 FlowGraphNode *GenIR::makeFlowGraphNode(uint32_t TargetOffset,
+                                        FlowGraphNode *PreviousNode,
                                         EHRegion *Region) {
+  BasicBlock *NextBlock =
+      (PreviousNode == nullptr ? nullptr : PreviousNode->getNextNode());
   FlowGraphNode *Node = (FlowGraphNode *)BasicBlock::Create(
-      *JitContext->LLVMContext, "", Function);
+      *JitContext->LLVMContext, "", Function, NextBlock);
   fgNodeSetStartMSILOffset(Node, TargetOffset);
   return Node;
 }
@@ -2091,21 +2192,14 @@ IRNode *GenIR::fgMakeEndFinally(IRNode *InsertNode, EHRegion *FinallyRegion,
   BasicBlock *TargetBlock = Switch->getParent();
   if (TargetBlock == nullptr) {
     // This is the first endfinally for this finally.  Generate a block to
-    // hold the switch.
-    TargetBlock = BasicBlock::Create(*JitContext->LLVMContext, "endfinally",
-                                     Function, Block->getNextNode());
+    // hold the switch. Use the finally end offset as the switch block's
+    // begin/end.
+    TargetBlock = createPointBlock(FinallyRegion->EndMsilOffset, "endfinally");
     LLVMBuilder->SetInsertPoint(TargetBlock);
 
     // Insert the load of the selector variable and the switch.
     LLVMBuilder->Insert((LoadInst *)Switch->getCondition());
     LLVMBuilder->Insert(Switch);
-
-    // Use the finally end offset as the switch block's begin/end.
-    FlowGraphNode *TargetNode = (FlowGraphNode *)TargetBlock;
-    uint32_t EndOffset = FinallyRegion->EndMsilOffset;
-    fgNodeSetStartMSILOffset(TargetNode, EndOffset);
-    fgNodeSetEndMSILOffset(TargetNode, EndOffset);
-    fgNodeSetPropagatesOperandStack(TargetNode, false);
   }
 
   // Generate and return branch to the block that holds the switch
@@ -2143,9 +2237,25 @@ IRNode *GenIR::fgNodeGetEndInsertIRNode(FlowGraphNode *FgNode) {
   return (IRNode *)InsertInst;
 }
 
+void GenIR::movePointBlocks(BasicBlock *OldBlock, BasicBlock *NewBlock) {
+  BasicBlock *MoveBeforeBlock = NewBlock;
+  uint32_t PointOffset = fgNodeGetStartMSILOffset((FlowGraphNode *)OldBlock);
+  BasicBlock *PointBlock = OldBlock->getPrevNode();
+  BasicBlock *PrevBlock = PointBlock->getPrevNode();
+  while (
+      (PointOffset == fgNodeGetStartMSILOffset((FlowGraphNode *)PointBlock)) &&
+      (PointOffset == fgNodeGetEndMSILOffset((FlowGraphNode *)PointBlock))) {
+    PointBlock->moveBefore(MoveBeforeBlock);
+    MoveBeforeBlock = PointBlock;
+    PointBlock = PrevBlock;
+    PrevBlock = PrevBlock->getPrevNode();
+  }
+}
+
 void GenIR::replaceFlowGraphNodeUses(FlowGraphNode *OldNode,
                                      FlowGraphNode *NewNode) {
   BasicBlock *OldBlock = (BasicBlock *)OldNode;
+  movePointBlocks(OldBlock, NewNode);
   OldBlock->replaceAllUsesWith(NewNode);
   OldBlock->eraseFromParent();
 }
@@ -2266,7 +2376,7 @@ FlowGraphNode *GenIR::fgNodeGetNext(FlowGraphNode *FgNode) {
 
 FlowGraphNode *GenIR::fgPrePhase(FlowGraphNode *Fg) { return FirstMSILBlock; }
 
-void GenIR::fgPostPhase() { return; }
+void GenIR::fgPostPhase() { DoneBuildingFlowGraph = true; }
 
 void GenIR::fgAddLabelToBranchList(IRNode *LabelNode, IRNode *BranchNode) {
   return;
@@ -3843,12 +3953,9 @@ IRNode *GenIR::genCall(ReaderCallTargetData *CallTargetInfo, bool MayThrow,
   }
 
   CorInfoCallConv CC = Signature.getCallingConvention();
-  if (CallTargetInfo->isIndirect()) {
-    if (CC == CORINFO_CALLCONV_STDCALL || CC == CORINFO_CALLCONV_C ||
-        CC == CORINFO_CALLCONV_THISCALL || CC == CORINFO_CALLCONV_FASTCALL ||
-        CC == CORINFO_CALLCONV_NATIVEVARARG) {
-      throw NotYetImplementedException("PInvoke call");
-    }
+  bool IsUnmanagedCall = CC != CORINFO_CALLCONV_DEFAULT;
+  if (!CallTargetInfo->isIndirect() && IsUnmanagedCall) {
+    throw NotYetImplementedException("Direct unmanaged call");
   }
 
   CallArgType ResultType = Signature.getResultType();
@@ -4486,6 +4593,44 @@ void GenIR::dup(IRNode *Opr, IRNode **Result1, IRNode **Result2) {
   *Result2 = Opr;
 }
 
+bool GenIR::interlockedCmpXchg(IRNode *Destination, IRNode *Exchange,
+                               IRNode *Comparand, IRNode **Result,
+                               CorInfoIntrinsics IntrinsicID) {
+  ASSERT(Exchange->getType() == Comparand->getType());
+  switch (IntrinsicID) {
+  case CORINFO_INTRINSIC_InterlockedCmpXchg32:
+    ASSERT(Exchange->getType() == Type::getInt32Ty(*JitContext->LLVMContext));
+    break;
+  case CORINFO_INTRINSIC_InterlockedCmpXchg64:
+    ASSERT(Exchange->getType() == Type::getInt64Ty(*JitContext->LLVMContext));
+    break;
+  default:
+    throw NotYetImplementedException("interlockedCmpXchg");
+  }
+
+  Type *ComparandTy = Comparand->getType();
+  Type *DestinationTy = Destination->getType();
+
+  if (DestinationTy->isIntegerTy()) {
+    Type *CastTy = getManagedPointerType(ComparandTy);
+    Destination = (IRNode *)LLVMBuilder->CreateIntToPtr(Destination, CastTy);
+  } else {
+    ASSERT(DestinationTy->isPointerTy());
+    Type *CastTy = isManagedPointerType(DestinationTy)
+                       ? getManagedPointerType(ComparandTy)
+                       : getUnmanagedPointerType(ComparandTy);
+    Destination = (IRNode *)LLVMBuilder->CreatePointerCast(Destination, CastTy);
+  }
+
+  Value *Pair = LLVMBuilder->CreateAtomicCmpXchg(
+      Destination, Comparand, Exchange, llvm::SequentiallyConsistent,
+      llvm::SequentiallyConsistent);
+  *Result =
+      (IRNode *)LLVMBuilder->CreateExtractValue(Pair, 0, "cmpxchg_result");
+
+  return true;
+}
+
 bool GenIR::memoryBarrier() {
   // TODO: Here we emit mfence which is stronger than sfence
   // that CLR needs.
@@ -4708,7 +4853,7 @@ uint32_t GenIR::updateLeaveOffset(EHRegion *Region, uint32_t LeaveOffset,
         // First finally for this function; generate an unreachable block
         // that can be used as the default switch target.
         UnreachableContinuationBlock =
-            BasicBlock::Create(Context, "NullDefault", Function);
+            createPointBlock(MethodInfo->ILCodeSize, "NullDefault");
         new UnreachableInst(Context, UnreachableContinuationBlock);
         fgNodeSetPropagatesOperandStack(
             (FlowGraphNode *)UnreachableContinuationBlock, false);
@@ -4811,7 +4956,9 @@ IRNode *GenIR::handleToIRNode(mdToken Token, void *EmbHandle, void *RealHandle,
                               bool IsRelocatable, bool IsCallTarget,
                               bool IsFrozenObject /* default = false */
                               ) {
-  if (IsIndirect || IsCallTarget || IsFrozenObject) {
+  LLVMContext &LLVMContext = *JitContext->LLVMContext;
+
+  if (IsCallTarget || IsFrozenObject) {
     throw NotYetImplementedException("NYI handle cases");
   }
 
@@ -4821,8 +4968,15 @@ IRNode *GenIR::handleToIRNode(mdToken Token, void *EmbHandle, void *RealHandle,
   uint32_t NumBits = TargetPointerSizeInBits;
   bool IsSigned = false;
 
-  ConstantInt *HandleValue = ConstantInt::get(
-      *JitContext->LLVMContext, APInt(NumBits, (uint64_t)EmbHandle, IsSigned));
+  Value *HandleValue = ConstantInt::get(
+      LLVMContext, APInt(NumBits, (uint64_t)EmbHandle, IsSigned));
+
+  if (IsIndirect) {
+    Type *HandleTy = Type::getIntNTy(LLVMContext, TargetPointerSizeInBits);
+    Type *HandlePtrTy = getUnmanagedPointerType(HandleTy);
+    Value *HandlePtr = LLVMBuilder->CreateIntToPtr(HandleValue, HandlePtrTy);
+    HandleValue = LLVMBuilder->CreateLoad(HandlePtr);
+  }
 
   return (IRNode *)HandleValue;
 }
@@ -4893,6 +5047,22 @@ BasicBlock *GenIR::createPointBlock(uint32_t PointOffset,
   // any successor block will get the stack propagated from the other
   // predecessor.
   fgNodeSetPropagatesOperandStack(PointFlowGraphNode, false);
+
+  if (!DoneBuildingFlowGraph) {
+    // Position this block in the list so that it will get moved to its point
+    // at the end of flow-graph construction.
+    if (PointOffset == MethodInfo->ILCodeSize) {
+      // The point is the end of the function, which is already where this
+      // block is.
+    } else {
+      // Request a split at PointOffset, and move this block before the temp
+      // target so it will get moved after the split is created (in
+      // movePointBlocks).
+      FlowGraphNode *Next = nullptr;
+      fgAddNodeMSILOffset(&Next, PointOffset);
+      Block->moveBefore(Next);
+    }
+  }
 
   return Block;
 }
@@ -5120,7 +5290,7 @@ IRNode *GenIR::loadNonPrimitiveObj(IRNode *Addr,
   LoadInst->setAlignment(Align);
 
   return (IRNode *)LoadInst;
-};
+}
 
 void GenIR::classifyCmpType(Type *Ty, uint32_t &Size, bool &IsPointer,
                             bool &IsFloat) {

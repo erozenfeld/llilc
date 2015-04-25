@@ -256,7 +256,8 @@ public:
                  llvm::Type *> *ArrayTypeMap,
         std::map<CORINFO_FIELD_HANDLE, uint32_t> *FieldIndexMap)
       : ReaderBase(JitContext->JitInfo, JitContext->MethodInfo,
-                   JitContext->Flags) {
+                   JitContext->Flags),
+        UnmanagedCallFrame(nullptr), ThreadPointer(nullptr) {
     this->JitContext = JitContext;
     this->ClassTypeMap = ClassTypeMap;
     this->ReverseClassTypeMap = ReverseClassTypeMap;
@@ -465,11 +466,11 @@ public:
                                  CorInfoIntrinsics IntrinsicID) override {
     throw NotYetImplementedException("interlockedIntrinsicBinOp");
   };
-  bool interlockedCmpXchg(IRNode *Arg1, IRNode *Arg2, IRNode *Arg3,
-                          IRNode **RetVal,
-                          CorInfoIntrinsics IntrinsicID) override {
-    throw NotYetImplementedException("interlockedCmpXchg");
-  };
+
+  bool interlockedCmpXchg(IRNode *Destination, IRNode *Exchange,
+                          IRNode *Comparand, IRNode **Result,
+                          CorInfoIntrinsics IntrinsicID) override;
+
   bool memoryBarrier() override;
 
   void switchOpcode(IRNode *Opr) override;
@@ -636,6 +637,7 @@ public:
     throw NotYetImplementedException("insertEHAnnotationNode");
   };
   FlowGraphNode *makeFlowGraphNode(uint32_t TargetOffset,
+                                   FlowGraphNode *PreviousNode,
                                    EHRegion *Region) override;
   void markAsEHLabel(IRNode *LabelNode) override {
     throw NotYetImplementedException("markAsEHLabel");
@@ -1005,6 +1007,18 @@ private:
   /// \returns          The newly-created successor block
   llvm::BasicBlock *splitCurrentBlock(llvm::TerminatorInst **Goto = nullptr);
 
+  /// \brief Move point blocks preceding \p OldBlock to just before \p NewBlock
+  ///
+  /// Point blocks created during the first pass flow-graph construction are
+  /// inserted before temp blocks created for their point.  Then they are moved
+  /// to the appropriate spot when branches to temp blocks are being rewritten.
+  /// This is the routine invoked during branch rewriting to move them.
+  ///
+  /// \param OldBlock Temporary block whose associated point blocks are to be
+  ///                 fixed up
+  /// \param NewBlock "Real" block that begins at the point in question
+  void movePointBlocks(llvm::BasicBlock *OldBlock, llvm::BasicBlock *NewBlock);
+
   /// Insert one instruction in place of another.
   ///
   /// \param OldInstruction The instruction to be removed.  Must have no uses.
@@ -1174,8 +1188,8 @@ private:
 
   /// Store a value to an argument passed indirectly.
   ///
-  /// The storage backing such arguments may be loacted on the heap; any stores
-  /// to these loactions may need write barriers.
+  /// The storage backing such arguments may be located on the heap; any stores
+  /// to these locations may need write barriers.
   ///
   /// \param ValueArgType  EE type info for the value to store.
   /// \param ValueToStore  The value to store.
@@ -1267,11 +1281,19 @@ private:
   /// \brief Insert IR to setup the security object
   void insertIRForSecurityObject();
 
+  /// \brief Insert IR to setup the unmanaged call frame (PInvoke frame) and
+  ///        the thread pointer.
+  void insertIRForUnmanagedCallFrame();
+
   /// \brief Create the @gc.safepoint_poll() method
   /// Creates the @gc.safepoint_poll() method and insertes it into the
   /// current module. This helper is required by the LLVM GC-Statepoint
   /// insertion phase.
   void createSafepointPoll();
+
+  /// \brief Override of doTailCallOpt method
+  /// Provides client specific Options look up.
+  bool doTailCallOpt() override;
 
   /// If isZeroInitLocals() returns true, zero intitialize all locals;
   /// otherwise, zero initialize all gc pointers and structs with gc pointers.
@@ -1313,6 +1335,12 @@ private:
   std::map<CORINFO_FIELD_HANDLE, uint32_t> *FieldIndexMap;
   std::map<llvm::BasicBlock *, FlowGraphNodeInfo> FlowGraphInfoMap;
   std::vector<llvm::Value *> LocalVars;
+  llvm::Value *UnmanagedCallFrame; ///< If the method contains unmanaged calls,
+                                   ///< this is the address of the unmanaged
+                                   ///< call frame.
+  llvm::Value *ThreadPointer;      ///< If the method contains unmanaged calls,
+                                   ///< this is the address of the pointer to
+                                   ///< the runtime thread.
   std::vector<CorInfoType> LocalVarCorTypes;
   std::vector<llvm::Value *> Arguments;
   llvm::Value *IndirectResult;
@@ -1321,6 +1349,7 @@ private:
   llvm::BasicBlock *UnreachableContinuationBlock;
   bool KeepGenericContextAlive;
   bool NeedsSecurityObject;
+  bool DoneBuildingFlowGraph;
   llvm::BasicBlock *EntryBlock;
   llvm::Instruction *TempInsertionPoint;
   IRNode *MethodSyncHandle; ///< If the method is synchronized, this is
