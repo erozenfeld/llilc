@@ -4051,7 +4051,7 @@ void ReaderBase::rdrCallFieldHelper(
       // What this means, is that the helper will *not* return the
       // value that we are interested in.  Instead, it will pass a
       // pointer to the return value as the first param.
-      Arg1 = addressOfLeaf(Dst);
+      Arg1 = addressOfValue(Dst);
 
       // Arg 2
       Arg2 = Obj;
@@ -4222,9 +4222,7 @@ void ReaderBase::rdrCallWriteBarrierHelper(
     } else {
       // If the class doesn't have a gc layout then use a memcopy
       IRNode *Size = loadConstantI4(getClassSize(Class));
-      const bool MayThrow = true;
-      callHelper(CORINFO_HELP_MEMCPY, MayThrow, nullptr, Dst, Src, Size,
-                 nullptr, Alignment, IsVolatile);
+      cpBlk(Size, Src, Dst, Alignment, IsVolatile);
     }
   }
 }
@@ -5001,7 +4999,7 @@ ReaderBase::rdrCall(ReaderCallTargetData *Data, ReaderBaseNS::CallOpcode Opcode,
 #ifdef _WIN64
         case CORINFO_INTRINSIC_StubHelpers_GetStubContextAddr:
           IntrinsicRet = secretParam();
-          IntrinsicRet = addressOfLeaf(IntrinsicRet);
+          IntrinsicRet = addressOfValue(IntrinsicRet);
           if (IntrinsicRet) {
             return IntrinsicRet;
           }

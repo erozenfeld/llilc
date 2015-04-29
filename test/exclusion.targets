@@ -44,5 +44,30 @@
         <ExcludeList Include="$(XunitTestBinBase)\JIT\opt\Inline\Inline_Handler.cmd"/>
         <ExcludeList Include="$(XunitTestBinBase)\JIT\opt\Inline\Inline_Vars.cmd"/>
         <ExcludeList Include="$(XunitTestBinBase)\JIT\opt\Inline\InlineThrow.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\general_class_instance01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\general_class_static01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\general_struct_instance01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\general_struct_static01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_class_instance01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_class_instance02.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_class_static01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_class_static02.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_struct_instance01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_struct_instance02.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_struct_static01.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Generics\Exceptions\specific_struct_static02.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\bool.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\byte.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\char.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\decimal.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\double.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\float.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\int.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\long.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\sbyte.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\short.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\uint.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\ulong.cmd"/>
+        <ExcludeList Include="$(XunitTestBinBase)\JIT\Methodical\MDArray\DataTypes\ushort.cmd"/>
     </ItemGroup>
 </Project>
