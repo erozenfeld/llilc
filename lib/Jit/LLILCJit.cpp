@@ -315,10 +315,18 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
 
   std::string FuncName = JitContext->MethodName;
 
-  // this method needs _chkstk
-  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor")) {
+  // these methods needs _chkstk
+  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor") ||
+      !strcmp(FuncName.c_str(), "System.Reflection.Metadata.MetadataReader.InitializeTableReaders")) {
     if (DumpLevel >= ::DumpLevel::SUMMARY) {
-      errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
+      errs() << "Failed to read " << FuncName << '[' << "need _chkstk" << "]\n";
+    }
+    return false;
+  }
+
+  if (!strcmp(FuncName.c_str(), "DomainNeutralILStubClass.IL_STUB_PInvoke")) {
+    if (DumpLevel >= ::DumpLevel::SUMMARY) {
+      errs() << "Failed to read " << FuncName << '[' << "finalizer assert" << "]\n";
     }
     return false;
   }
