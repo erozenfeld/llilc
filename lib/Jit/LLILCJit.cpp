@@ -315,8 +315,8 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
 
   std::string FuncName = JitContext->MethodName;
 
-  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor") || // this method needs _chkstk
-    ) {
+  // this method needs _chkstk
+  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor")) {
     if (DumpLevel >= ::DumpLevel::SUMMARY) {
       errs() << "Failed to read " << FuncName << '[' << "skipped" << "]\n";
     }
