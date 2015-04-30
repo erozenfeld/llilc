@@ -1550,7 +1550,7 @@ public:
   FlowGraphNode *fgSplitBlock(FlowGraphNode *Block, uint32_t Offset,
                               IRNode *Node);
 
-#if defined(_DEBUG)
+#if !defined(NDEBUG)
   /// \brief Debug-only reader function to print range of MSIL.
   ///
   /// Print the MSIL in the buffer for the given range. Output emitted via
@@ -3208,6 +3208,13 @@ public:
   virtual IRNode *makeStackTypeNode(IRNode *Node) = 0;
 
   virtual IRNode *makeDirectCallTargetNode(void *CodeAddress) = 0;
+
+  /// \brief Infer the type of the 'this' argument to an indirect call from
+  ///        the given IR node.
+  ///
+  /// \param ThisArgument  The IR node that represents the 'this' argument.
+  /// \returns The class handle that corresponds to the type of the node.
+  virtual CORINFO_CLASS_HANDLE inferThisClass(IRNode *ThisArgument) = 0;
 
   // Called once region tree has been built.
   virtual void setEHInfo(EHRegion *EhRegionTree,
