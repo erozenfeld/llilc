@@ -318,18 +318,11 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
 
   std::string FuncName = JitContext->MethodName;
 
-  // these methods needs _chkstk
   if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor") ||
-      !strcmp(FuncName.c_str(), "System.Reflection.Metadata.MetadataReader.InitializeTableReaders")) {
+      !strcmp(FuncName.c_str(), "System.Reflection.Metadata.MetadataReader.InitializeTableReaders") ||
+      !strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.DesktopAssemblyIdentityComparer..cctor")) {
     if (DumpLevel >= ::DumpLevel::SUMMARY) {
-      errs() << "Failed to read " << FuncName << '[' << "need _chkstk" << "]\n";
-    }
-    return false;
-  }
-
-  if (!strcmp(FuncName.c_str(), "DomainNeutralILStubClass.IL_STUB_PInvoke")) {
-    if (DumpLevel >= ::DumpLevel::SUMMARY) {
-      errs() << "Failed to read " << FuncName << '[' << "finalizer assert" << "]\n";
+      errs() << "Failed to read " << FuncName << '[' << "need __chkstk" << "]\n";
     }
     return false;
   }
@@ -375,13 +368,10 @@ bool LLILCJit::outputGCInfo(LLILCJitContext *JitContext) {
     return false;
   }
 
-  // First word of the GCInfoBuffer should be the size of the method.
-  if (JitContext->HotCodeSize == 1024) {
-    JitContext->HotCodeSize = 1034;
-  }
 
-  if (JitContext->HotCodeSize == 2048) {
-    JitContext->HotCodeSize = 2058;
+  // First word of the GCInfoBuffer should be the size of the method.
+  if (JitContext->HotCodeSize % 1024 == 0) {
+    JitContext->HotCodeSize += 10;
   }
 
   *(uint32_t *)GCInfoBuffer = JitContext->HotCodeSize;
