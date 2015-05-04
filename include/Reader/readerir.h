@@ -392,9 +392,8 @@ public:
   };
 
   IRNode *loadAndBox(CORINFO_RESOLVED_TOKEN *ResolvedToken, IRNode *Addr,
-                     ReaderAlignType AlignmentPrefix) override {
-    throw NotYetImplementedException("loadAndBox");
-  };
+                     ReaderAlignType AlignmentPrefix) override;
+
   IRNode *convertHandle(IRNode *RuntimeTokenNode, CorInfoHelpFunc HelperID,
                         CORINFO_CLASS_HANDLE ClassHandle) override;
   void
@@ -580,6 +579,7 @@ public:
   };
   bool fgBlockHasFallThrough(FlowGraphNode *Block) override;
 
+  void fgRemoveUnusedBlocks(FlowGraphNode *FgHead) override;
   void fgDeleteBlock(FlowGraphNode *Block) override;
   void fgDeleteEdge(FlowGraphEdgeList *Arc) override {
     throw NotYetImplementedException("fgDeleteEdge");
