@@ -318,15 +318,6 @@ bool LLILCJit::readMethod(LLILCJitContext *JitContext) {
 
   std::string FuncName = JitContext->MethodName;
 
-  if (!strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.AttributeDescription..cctor") ||
-      !strcmp(FuncName.c_str(), "System.Reflection.Metadata.MetadataReader.InitializeTableReaders") ||
-      !strcmp(FuncName.c_str(), "Microsoft.CodeAnalysis.DesktopAssemblyIdentityComparer..cctor")) {
-    if (DumpLevel >= ::DumpLevel::SUMMARY) {
-      errs() << "Failed to read " << FuncName << '[' << "need __chkstk" << "]\n";
-    }
-    return false;
-  }
-
   try {
     Reader.msilToIR();
   } catch (NotYetImplementedException &Nyi) {
